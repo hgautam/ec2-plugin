@@ -121,6 +121,8 @@ public abstract class EC2Cloud extends Cloud {
 
     public static final String AWS_URL_HOST = "amazonaws.com";
 
+    public static final String AWS_CN_URL_HOST = "amazonaws.com.cn";
+
     public static final String EC2_SLAVE_TYPE_SPOT = "spot";
 
     public static final String EC2_SLAVE_TYPE_DEMAND = "demand";
@@ -360,6 +362,7 @@ public abstract class EC2Cloud extends Cloud {
     /**
      * Gets {@link SlaveTemplate} that has the matching {@link Label}.
      */
+    @Deprecated
     public SlaveTemplate getTemplate(Label label) {
         for (SlaveTemplate t : templates) {
             if (t.getMode() == Node.Mode.NORMAL) {
@@ -373,6 +376,25 @@ public abstract class EC2Cloud extends Cloud {
             }
         }
         return null;
+    }
+
+    /**
+     * Gets list of {@link SlaveTemplate} that matches {@link Label}.
+     */
+    public Collection<SlaveTemplate> getTemplates(Label label) {
+        List<SlaveTemplate> matchingTemplates = new ArrayList<>();
+        for (SlaveTemplate t : templates) {
+            if (t.getMode() == Node.Mode.NORMAL) {
+                if (label == null || label.matches(t.getLabelSet())) {
+                    matchingTemplates.add(t);
+                }
+            } else if (t.getMode() == Node.Mode.EXCLUSIVE) {
+                if (label != null && label.matches(t.getLabelSet())) {
+                    matchingTemplates.add(t);
+                }
+            }
+        }
+        return matchingTemplates;
     }
 
     /**
@@ -698,47 +720,48 @@ public abstract class EC2Cloud extends Cloud {
 
     @Override
     public Collection<PlannedNode> provision(final Label label, int excessWorkload) {
-        final SlaveTemplate t = getTemplate(label);
+        final Collection<SlaveTemplate> matchingTemplates = getTemplates(label);
         List<PlannedNode> plannedNodes = new ArrayList<>();
 
         Jenkins jenkinsInstance = Jenkins.get();
         if (jenkinsInstance.isQuietingDown()) {
             LOGGER.log(Level.FINE, "Not provisioning nodes, Jenkins instance is quieting down");
             return Collections.emptyList();
-        }
-        else if (jenkinsInstance.isTerminating()) {
+        } else if (jenkinsInstance.isTerminating()) {
             LOGGER.log(Level.FINE, "Not provisioning nodes, Jenkins instance is terminating");
             return Collections.emptyList();
         }
 
-        try {
-            LOGGER.log(Level.INFO, "{0}. Attempting to provision slave needed by excess workload of " + excessWorkload + " units", t);
-            int number = Math.max(excessWorkload / t.getNumExecutors(), 1);
-            final List<EC2AbstractSlave> slaves = getNewOrExistingAvailableSlave(t, number, false);
+        for (SlaveTemplate t : matchingTemplates) {
+            try {
+                LOGGER.log(Level.INFO, "{0}. Attempting to provision slave needed by excess workload of " + excessWorkload + " units", t);
+                int number = Math.max(excessWorkload / t.getNumExecutors(), 1);
+                final List<EC2AbstractSlave> slaves = getNewOrExistingAvailableSlave(t, number, false);
 
-            if (slaves == null || slaves.isEmpty()) {
-                LOGGER.warning("Can't raise nodes for " + t);
-                return Collections.emptyList();
-            }
-
-            for (final EC2AbstractSlave slave : slaves) {
-                if (slave == null) {
-                    LOGGER.warning("Can't raise node for " + t);
+                if (slaves == null || slaves.isEmpty()) {
+                    LOGGER.warning("Can't raise nodes for " + t);
                     continue;
                 }
 
-                plannedNodes.add(createPlannedNode(t, slave));
-                excessWorkload -= t.getNumExecutors();
-            }
+                for (final EC2AbstractSlave slave : slaves) {
+                    if (slave == null) {
+                        LOGGER.warning("Can't raise node for " + t);
+                        continue;
+                    }
 
-            LOGGER.log(Level.INFO, "{0}. Attempting provision finished, excess workload: " + excessWorkload, t);
-            LOGGER.log(Level.INFO, "We have now {0} computers, waiting for {1} more",
-                    new Object[]{jenkinsInstance.getComputers().length, plannedNodes.size()});
-            return plannedNodes;
-        } catch (AmazonClientException e) {
-            LOGGER.log(Level.WARNING, t + ". Exception during provisioning", e);
-            return Collections.emptyList();
+                    plannedNodes.add(createPlannedNode(t, slave));
+                    excessWorkload -= t.getNumExecutors();
+                }
+
+                LOGGER.log(Level.INFO, "{0}. Attempting provision finished, excess workload: " + excessWorkload, t);
+                if (excessWorkload == 0) break;
+            } catch (AmazonClientException e) {
+                LOGGER.log(Level.WARNING, t + ". Exception during provisioning", e);
+            }
         }
+        LOGGER.log(Level.INFO, "We have now {0} computers, waiting for {1} more",
+            new Object[]{jenkinsInstance.getComputers().length, plannedNodes.size()});
+        return plannedNodes;
     }
 
     private static void attachSlavesToJenkins(Jenkins jenkins, List<EC2AbstractSlave> slaves, SlaveTemplate t) throws IOException {
@@ -875,7 +898,7 @@ public abstract class EC2Cloud extends Cloud {
 
     @Override
     public boolean canProvision(Label label) {
-        return getTemplate(label) != null;
+        return !getTemplates(label).isEmpty();
     }
 
     protected AWSCredentialsProvider createCredentialsProvider() {
@@ -976,13 +999,27 @@ public abstract class EC2Cloud extends Cloud {
     }
 
     /***
+     * Returns the DNS endpoint for a AWS service based on region provided
+     */
+    public static String getAwsPartitionHostForService(String region, String service) {
+        String host;
+        if (region != null && region.startsWith("cn-")) {
+            host = service + "." + region + "." + AWS_CN_URL_HOST;
+        } else {
+            host = service + "." + region + "." + AWS_URL_HOST;
+        }
+        return host;
+    }
+
+    /***
      * Convert a configured hostname like 'us-east-1' to a FQDN or ip address
      */
     public static String convertHostName(String ec2HostName) {
         if (ec2HostName == null || ec2HostName.length() == 0)
             ec2HostName = DEFAULT_EC2_HOST;
-        if (!ec2HostName.contains("."))
-            ec2HostName = "ec2." + ec2HostName + "." + AWS_URL_HOST;
+        if (!ec2HostName.contains(".")) {
+            ec2HostName = getAwsPartitionHostForService(ec2HostName, "ec2");
+        }
         return ec2HostName;
     }
 
@@ -1086,9 +1123,11 @@ public abstract class EC2Cloud extends Cloud {
             BufferedReader br = new BufferedReader(new StringReader(privateKey));
             String line;
             while ((line = br.readLine()) != null) {
-                if (line.equals("-----BEGIN RSA PRIVATE KEY-----"))
+                if (line.equals("-----BEGIN RSA PRIVATE KEY-----") ||
+                        line.equals("-----BEGIN OPENSSH PRIVATE KEY-----"))
                     hasStart = true;
-                if (line.equals("-----END RSA PRIVATE KEY-----"))
+                if (line.equals("-----END RSA PRIVATE KEY-----") ||
+                        line.equals("-----END OPENSSH PRIVATE KEY-----"))
                     hasEnd = true;
             }
             if (!hasStart)

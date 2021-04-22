@@ -1,6 +1,7 @@
 - amazonEC2:
+    altEC2Endpoint: "https.//ec2.us-east-1.amazonaws.com"
     cloudName: "production"
-    region: "us-east-1"
+    region: "eu-central-1"
     sshKeysCredentialsId: "random credentials id"
     templates:
     - ami: "ami-12345"
